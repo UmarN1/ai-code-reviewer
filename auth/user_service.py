@@ -75,3 +75,4 @@ def process_large_file(filepath):
 # BUG: Hardcoded secret — should be loaded from environment variables
 SECRET_KEY = "super_secret_key_123"
 DATABASE_URL = "postgresql://admin:password123@localhost/mydb"
+"updated" 
