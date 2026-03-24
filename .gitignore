@@ -1,5 +1,28 @@
-__pycache__/ 
-*.pyc 
-.env 
-*.txt 
-!requirements.txt
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# never commit secrets or API keys
+.env
+.env.local
+*.env
+
+# IDE stuff
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# test output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# logs
+*.log

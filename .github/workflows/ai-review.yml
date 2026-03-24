@@ -1,3 +1,14 @@
+# ai-review.yml
+# GitHub Actions workflow that triggers on every pull request and runs
+# the AI code reviewer.
+#
+# It needs two permissions:
+# - contents: read  (to check out the repo)
+# - pull-requests: write  (to post the review comments)
+#
+# ANTHROPIC_API_KEY needs to be added as a repository secret.
+# GITHUB_TOKEN is provided automatically by GitHub Actions.
+
 name: AI Code Reviewer
 
 on:

@@ -1,10 +1,15 @@
-"""
-Claude reviewer — sends file diffs to the Anthropic API and parses
-structured review comments back out.
-
-Uses claude-sonnet-4-20250514. The system prompt is engineered to produce
-JSON-structured output so we can reliably map comments to diff positions.
-"""
+# claude_reviewer.py
+# Sends file diffs to the Anthropic Claude API and parses the response.
+#
+# The main thing I had to think about here was the system prompt.
+# Generic prompts give generic feedback. I wanted Claude to behave
+# like a specific type of reviewer - someone senior, someone who
+# prioritises real bugs over style opinions, and someone who gives
+# actionable advice not just "this could be better".
+#
+# I also needed structured output so I can actually use the results
+# programmatically. Getting Claude to return consistent JSON took a
+# bit of prompt engineering.
 
 import json
 import re
@@ -12,59 +17,61 @@ import anthropic
 from diff_parser import get_diff_position
 
 
-SYSTEM_PROMPT = """You are an expert senior software engineer conducting a thorough code review.
-Your job is to review code changes (unified diffs) and provide specific, actionable, 
-line-level feedback. You focus on:
+# this is the most important part of the whole project honestly
+# the prompt is what determines the quality of the reviews
+SYSTEM_PROMPT = """You are a senior software engineer doing a code review.
+You have 8 years of experience and you care about catching real problems,
+not nitpicking style.
 
-1. **Bugs and correctness** — logic errors, off-by-one errors, null/undefined handling,
-   incorrect assumptions, race conditions, unhandled exceptions.
+You review code diffs and give specific, line-level feedback. You focus on:
 
-2. **Security vulnerabilities** — SQL injection, XSS, hardcoded secrets, insecure 
-   defaults, improper input validation, dependency issues.
+1. Security issues - SQL injection, hardcoded secrets, missing input validation,
+   broken authentication, insecure defaults
 
-3. **Performance problems** — unnecessary loops inside loops, missing indexes, 
-   blocking calls in async code, memory leaks, inefficient algorithms.
+2. Bugs - logic errors, null pointer issues, unhandled exceptions, off-by-one errors,
+   race conditions, incorrect assumptions
 
-4. **Code quality** — overly complex functions, missing error handling, unclear 
-   variable names, code that will be hard to maintain or test.
+3. Performance - N+1 queries, loading huge files into memory, O(n^2) loops,
+   blocking calls in async code
 
-5. **Best practices** — language-specific idioms being violated, missing type hints,
-   magic numbers/strings, violation of DRY or SOLID principles.
+4. Maintainability - functions that do too much, missing error handling,
+   code that will be impossible to test or debug later
 
 You do NOT comment on:
-- Stylistic preferences (tabs vs spaces, formatting) — that's what linters are for.
-- Things that are purely subjective with no clear better option.
-- Lines that look perfectly fine — only comment when there is a real concern.
+- Formatting, whitespace, or style (that's what linters are for)
+- Things that are purely subjective preference
+- Lines that look perfectly fine
 
-OUTPUT FORMAT — you MUST respond with valid JSON only. No markdown fences, no prose.
-Return a JSON array of comment objects. Each object has exactly these fields:
+You respond ONLY with a JSON array. No markdown, no explanation, just the array.
+Each item has exactly these fields:
 
 {
-  "line_number": <integer — the line number in the new file being commented on>,
+  "line_number": <integer - the line number in the new version of the file>,
   "severity": <"error" | "warning" | "suggestion">,
-  "comment": <string — your review comment in GitHub Markdown format>
+  "comment": <string - your feedback in GitHub markdown format>
 }
 
-If you find no issues, return an empty array: []
+If you find no real issues, return an empty array: []
 
-Rules:
-- line_number must be a line that appears in the diff (a + line or context line).
-- Keep each comment focused and specific. Reference the actual code.
-- Use markdown in the comment field — backticks for code, bold for emphasis.
-- Maximum 5 comments per file. Prioritize the most important issues.
-- severity "error" = likely bug or security issue. "warning" = should fix. 
-  "suggestion" = consider changing.
+Important rules:
+- line_number must be a line that appears in the diff (a + or context line)
+- Keep comments specific - mention the actual code, not vague generalities
+- Maximum 5 comments per file - focus on the most important things
+- error = definite bug or security hole
+- warning = probably should fix this
+- suggestion = consider this, but it's not urgent
 """
 
 
 class ClaudeReviewer:
-    def __init__(self, api_key: str):
+
+    def __init__(self, api_key):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def review_file(self, file_info: dict) -> list[dict]:
+    def review_file(self, file_info):
         """
-        Review a single file diff with Claude.
-        Returns a list of comment dicts ready to post to GitHub.
+        Sends a single file diff to Claude and returns a list of
+        comment dicts ready to post to GitHub.
         """
         filename = file_info["filename"]
         diff_text = file_info["diff_text"]
@@ -72,11 +79,12 @@ class ClaudeReviewer:
         if not diff_text.strip():
             return []
 
+        # build the message - include filename so Claude has context
+        # about what kind of file it's looking at
         user_message = (
-            f"Please review the following code diff for `{filename}`.\n\n"
+            f"Please review this diff for `{filename}`:\n\n"
             f"```diff\n{diff_text}\n```\n\n"
-            "Respond with a JSON array of review comments as specified. "
-            "Only comment on real issues — return [] if the code looks fine."
+            "Return a JSON array of issues. Return [] if the code looks fine."
         )
 
         try:
@@ -84,17 +92,21 @@ class ClaudeReviewer:
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
+                messages=[
+                    {"role": "user", "content": user_message}
+                ],
             )
         except anthropic.APIError as e:
-            print(f"[ERROR] Anthropic API error for {filename}: {e}")
+            print(f"[ERROR] Claude API error for {filename}: {e}")
             return []
 
         raw_text = response.content[0].text.strip()
-        raw_comments = self._parse_response(raw_text, filename)
+        raw_comments = self._parse_json_response(raw_text, filename)
 
-        # Map Claude's line numbers to GitHub diff positions
+        # now we need to convert Claude's line numbers into GitHub diff positions
+        # this is the part that took the most debugging to get right
         github_comments = []
+
         for item in raw_comments:
             line_num = item.get("line_number")
             severity = item.get("severity", "suggestion")
@@ -103,20 +115,24 @@ class ClaudeReviewer:
             if not line_num or not comment_text:
                 continue
 
+            # look up the diff position for this line number
             diff_pos = get_diff_position(file_info, line_num)
+
             if diff_pos is None:
-                # Line not in diff — skip (can't attach inline comment)
-                print(f"[WARN] Line {line_num} in {filename} not found in diff, skipping.")
+                # Claude gave us a line number that's not in the diff
+                # this can happen with context lines near the edge of a hunk
+                print(f"[WARN] line {line_num} in {filename} not in diff, skipping")
                 continue
 
-            # Format the comment body with severity badge
-            severity_badge = {
-                "error":      "🔴 **Error**",
-                "warning":    "🟡 **Warning**",
-                "suggestion": "🔵 **Suggestion**",
-            }.get(severity, "🔵 **Suggestion**")
+            # format the comment with a severity badge
+            if severity == "error":
+                badge = "🔴 **Error**"
+            elif severity == "warning":
+                badge = "🟡 **Warning**"
+            else:
+                badge = "🔵 **Suggestion**"
 
-            body = f"{severity_badge}\n\n{comment_text}\n\n*— AI Code Reviewer*"
+            body = f"{badge}\n\n{comment_text}\n\n*— AI Code Reviewer*"
 
             github_comments.append({
                 "path": filename,
@@ -126,22 +142,30 @@ class ClaudeReviewer:
 
         return github_comments
 
-    def _parse_response(self, raw_text: str, filename: str) -> list[dict]:
-        """Parse Claude's JSON response, with fallback handling."""
-        # Strip markdown code fences if Claude added them despite instructions
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+    def _parse_json_response(self, raw_text, filename):
+        # Claude usually returns clean JSON but sometimes wraps it in
+        # markdown code fences even when you tell it not to
+        # this handles both cases
+        cleaned = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw_text,
+            flags=re.MULTILINE
+        ).strip()
 
         try:
-            parsed = json.loads(clean)
+            parsed = json.loads(cleaned)
+
+            # handle the case where Claude wraps the array in an object
             if isinstance(parsed, list):
                 return parsed
-            # Sometimes Claude wraps in {"comments": [...]}
             if isinstance(parsed, dict):
-                for key in ("comments", "review", "issues", "results"):
+                for key in ("comments", "issues", "review", "results"):
                     if key in parsed and isinstance(parsed[key], list):
                         return parsed[key]
+
         except json.JSONDecodeError:
-            print(f"[WARN] Could not parse JSON response for {filename}.")
-            print(f"[WARN] Raw response: {raw_text[:200]}")
+            print(f"[WARN] could not parse JSON response for {filename}")
+            print(f"[WARN] raw response was: {raw_text[:300]}")
 
         return []
