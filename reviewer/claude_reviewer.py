@@ -1,90 +1,60 @@
-# claude_reviewer.py
-# Sends file diffs to the Anthropic Claude API and parses the response.
-#
-# The main thing I had to think about here was the system prompt.
-# Generic prompts give generic feedback. I wanted Claude to behave
-# like a specific type of reviewer - someone senior, someone who
-# prioritises real bugs over style opinions, and someone who gives
-# actionable advice not just "this could be better".
-#
-# I also needed structured output so I can actually use the results
-# programmatically. Getting Claude to return consistent JSON took a
-# bit of prompt engineering.
-
 import json
 import re
 import anthropic
 from diff_parser import get_diff_position
 
 
-# this is the most important part of the whole project honestly
-# the prompt is what determines the quality of the reviews
-SYSTEM_PROMPT = """You are a senior software engineer doing a code review.
-You have 8 years of experience and you care about catching real problems,
-not nitpicking style.
+# tried a few different prompts, this one gives the most useful results
+SYSTEM_PROMPT = """You are a senior software engineer doing a thorough code review.
+Look at the diff and identify real problems worth fixing.
 
-You review code diffs and give specific, line-level feedback. You focus on:
+Things to look for:
+- Bugs and logic errors
+- Security issues (SQL injection, hardcoded secrets, weak crypto, missing input validation)
+- Performance problems (N+1 queries, loading entire files into memory, nested loops)
+- Missing error handling
+- Anything that would cause problems in production
 
-1. Security issues - SQL injection, hardcoded secrets, missing input validation,
-   broken authentication, insecure defaults
+Do NOT comment on:
+- Code style or formatting
+- Subjective naming preferences
+- Things that look perfectly fine
 
-2. Bugs - logic errors, null pointer issues, unhandled exceptions, off-by-one errors,
-   race conditions, incorrect assumptions
+Only flag things that genuinely need attention.
 
-3. Performance - N+1 queries, loading huge files into memory, O(n^2) loops,
-   blocking calls in async code
-
-4. Maintainability - functions that do too much, missing error handling,
-   code that will be impossible to test or debug later
-
-You do NOT comment on:
-- Formatting, whitespace, or style (that's what linters are for)
-- Things that are purely subjective preference
-- Lines that look perfectly fine
-
-You respond ONLY with a JSON array. No markdown, no explanation, just the array.
-Each item has exactly these fields:
-
+You must respond with a JSON array only. No extra text or markdown around it.
+Each item should look like this:
 {
-  "line_number": <integer - the line number in the new version of the file>,
-  "severity": <"error" | "warning" | "suggestion">,
-  "comment": <string - your feedback in GitHub markdown format>
+  "line_number": <the line number in the new file>,
+  "severity": <"error" or "warning" or "suggestion">,
+  "comment": <your feedback as a markdown string>
 }
 
-If you find no real issues, return an empty array: []
+Return [] if you find nothing wrong.
 
-Important rules:
-- line_number must be a line that appears in the diff (a + or context line)
-- Keep comments specific - mention the actual code, not vague generalities
-- Maximum 5 comments per file - focus on the most important things
-- error = definite bug or security hole
-- warning = probably should fix this
-- suggestion = consider this, but it's not urgent
+Important:
+- line_number must be a line that actually appears in the diff
+- be specific, reference the actual code in your comment
+- max 5 comments per file, focus on the worst issues
+- error = likely bug or security hole, warning = should fix, suggestion = nice to have
 """
 
 
 class ClaudeReviewer:
-
     def __init__(self, api_key):
         self.client = anthropic.Anthropic(api_key=api_key)
 
     def review_file(self, file_info):
-        """
-        Sends a single file diff to Claude and returns a list of
-        comment dicts ready to post to GitHub.
-        """
         filename = file_info["filename"]
         diff_text = file_info["diff_text"]
 
         if not diff_text.strip():
             return []
 
-        # build the message - include filename so Claude has context
-        # about what kind of file it's looking at
-        user_message = (
+        prompt = (
             f"Please review this diff for `{filename}`:\n\n"
             f"```diff\n{diff_text}\n```\n\n"
-            "Return a JSON array of issues. Return [] if the code looks fine."
+            "Return a JSON array of issues you find. Return [] if everything looks fine."
         )
 
         try:
@@ -92,80 +62,69 @@ class ClaudeReviewer:
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
-                messages=[
-                    {"role": "user", "content": user_message}
-                ],
+                messages=[{"role": "user", "content": prompt}],
             )
         except anthropic.APIError as e:
-            print(f"[ERROR] Claude API error for {filename}: {e}")
+            print(f"[ERROR] claude API error for {filename}: {e}")
             return []
 
         raw_text = response.content[0].text.strip()
-        raw_comments = self._parse_json_response(raw_text, filename)
+        raw_comments = self._parse_response(raw_text, filename)
 
-        # now we need to convert Claude's line numbers into GitHub diff positions
-        # this is the part that took the most debugging to get right
+        # convert claude's line numbers to github diff positions
+        # this is necessary because github's inline comment api doesnt
+        # accept regular line numbers, it needs the diff position
         github_comments = []
 
         for item in raw_comments:
             line_num = item.get("line_number")
             severity = item.get("severity", "suggestion")
-            comment_text = item.get("comment", "")
+            comment_body = item.get("comment", "")
 
-            if not line_num or not comment_text:
+            if not line_num or not comment_body:
                 continue
 
-            # look up the diff position for this line number
             diff_pos = get_diff_position(file_info, line_num)
-
             if diff_pos is None:
-                # Claude gave us a line number that's not in the diff
-                # this can happen with context lines near the edge of a hunk
-                print(f"[WARN] line {line_num} in {filename} not in diff, skipping")
+                # line wasnt in the diff so we cant attach a comment to it
+                print(f"[WARN] line {line_num} not found in diff for {filename}, skipping")
                 continue
 
-            # format the comment with a severity badge
-            if severity == "error":
-                badge = "🔴 **Error**"
-            elif severity == "warning":
-                badge = "🟡 **Warning**"
-            else:
-                badge = "🔵 **Suggestion**"
+            severity_label = {
+                "error":      "🔴 **Error**",
+                "warning":    "🟡 **Warning**",
+                "suggestion": "🔵 **Suggestion**",
+            }.get(severity, "🔵 **Suggestion**")
 
-            body = f"{badge}\n\n{comment_text}\n\n*— AI Code Reviewer*"
+            full_comment = f"{severity_label}\n\n{comment_body}\n\n*— AI Code Reviewer*"
 
             github_comments.append({
                 "path": filename,
                 "position": diff_pos,
-                "body": body,
+                "body": full_comment,
             })
 
         return github_comments
 
-    def _parse_json_response(self, raw_text, filename):
-        # Claude usually returns clean JSON but sometimes wraps it in
-        # markdown code fences even when you tell it not to
-        # this handles both cases
-        cleaned = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            raw_text,
-            flags=re.MULTILINE
-        ).strip()
+    def _parse_response(self, raw_text, filename):
+        # claude sometimes wraps the json in markdown fences even when told not to
+        # so we strip those out just in case
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
 
         try:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(clean)
 
-            # handle the case where Claude wraps the array in an object
             if isinstance(parsed, list):
                 return parsed
+
+            # sometimes it returns {"comments": [...]} instead of just the array
             if isinstance(parsed, dict):
-                for key in ("comments", "issues", "review", "results"):
+                for key in ("comments", "issues", "review"):
                     if key in parsed and isinstance(parsed[key], list):
                         return parsed[key]
 
         except json.JSONDecodeError:
-            print(f"[WARN] could not parse JSON response for {filename}")
-            print(f"[WARN] raw response was: {raw_text[:300]}")
+            print(f"[WARN] couldnt parse json response for {filename}")
+            print(f"[WARN] response was: {raw_text[:200]}")
 
         return []
