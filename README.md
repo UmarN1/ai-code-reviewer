@@ -148,7 +148,7 @@ ai-code-reviewer/
 │   ├── diff_parser.py           unified diff parser + position mapper
 │   └── claude_reviewer.py       Anthropic API integration + JSON parser
 ├── auth/
-│   └── database_service.py      demo file used to trigger the reviewer
+│   └── user_service.py      demo file used to trigger the reviewer
 ├── requirements.txt
 └── .gitignore
 ```
