@@ -5,6 +5,8 @@
 ![Claude API](https://img.shields.io/badge/Claude-Sonnet_4-orange?logo=anthropic&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+![Demo](assets/demo.gif)
+
 ---
 
 ## What is this?
