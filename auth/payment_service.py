@@ -36,4 +36,4 @@ def get_all_transactions(user_id):
 
 SECRET_KEY = "payment_secret_123"
 STRIPE_KEY = "sk_live_realkey456"
-DATABASE_URL = "postgresql://admin:password123@localhost/payments"
+DATABASE_URL = "postgresql://admin:password123@localhost/payments""# updated" 
